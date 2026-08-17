@@ -427,7 +427,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
     "csrc/libtorch_stable/fused_kimi_k3_mla_key_concat_kv_cache_kernel.cu")
 
-  if(VLLM_GPU_LANG STREQUAL "CUDA" AND
+  option(VLLM_BUILD_COOPERATIVE_TOPK
+    "Build the optional cooperative top-k CUDA kernel" ON)
+
+  if(VLLM_BUILD_COOPERATIVE_TOPK AND
+     VLLM_GPU_LANG STREQUAL "CUDA" AND
      DEFINED CMAKE_CUDA_COMPILER_VERSION AND
      CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
 
