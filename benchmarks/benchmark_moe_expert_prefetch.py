@@ -65,6 +65,7 @@ def main() -> None:
     sampling = SamplingParams(
         temperature=0,
         max_tokens=args.output_tokens,
+        ignore_eos=True,
         seed=args.seed,
     )
     generate_start = time.perf_counter()
