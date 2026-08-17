@@ -459,6 +459,17 @@ class CachedWeightProvider:
                 future is None or (future.done() and future.exception() is None)
             )
 
+    def _touch_host(self, expert_id: int) -> None:
+        if self._storage is None:
+            return
+        with self._host_lock:
+            entry = self._host_lru.get(expert_id)
+            if entry is None:
+                return
+            self._host_clock += 1
+            entry[1] += 1
+            entry[2] = self._host_clock
+
     def _ensure_host(self, expert_id: int, needed: set[int]) -> int:
         if self._storage is None:
             return expert_id
@@ -825,6 +836,7 @@ class CachedWeightProvider:
                 entry = self._lru[expert_id]
                 entry[1] += 1  # freq
                 entry[2] = self._clock  # last access
+                self._touch_host(expert_id)
                 self.hits += 1
             else:
                 # Cache miss: need to load expert

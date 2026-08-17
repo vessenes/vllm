@@ -128,6 +128,9 @@ def test_storage_backed_reactive_and_predicted_paths(tmp_path):
         )
     assert provider.storage_misses == 2
 
+    provider.prepare(_topk([1]))
+    assert provider._host_lru[1][1] == 2
+
     provider.invalidate(1)
     provider.prepare(_topk([1]))
     assert provider.storage_hits == 1
