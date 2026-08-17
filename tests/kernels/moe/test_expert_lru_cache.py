@@ -64,22 +64,24 @@ def _topk(ids: list[int]) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.int32, device="cuda").unsqueeze(0)
 
 
-def _make_storage_checkpoint(tmp_path, num_experts: int = 8):
-    layer = "layers.0.moe"
+def _make_storage_checkpoint(
+    tmp_path, num_experts: int = 8, layers: tuple[str, ...] = ("layers.0.moe",)
+):
     tensors = {}
-    for expert_id in range(num_experts):
-        prefix = f"{layer}.{expert_id}"
-        w13, w2 = _make_weights(num_experts, torch.bfloat16)
-        tensors[f"{prefix}.gate_proj.weight"] = w13[expert_id, :INTERMEDIATE]
-        tensors[f"{prefix}.up_proj.weight"] = w13[expert_id, INTERMEDIATE:]
-        tensors[f"{prefix}.down_proj.weight"] = w2[expert_id]
+    for layer in layers:
+        for expert_id in range(num_experts):
+            prefix = f"{layer}.{expert_id}"
+            w13, w2 = _make_weights(num_experts, torch.bfloat16)
+            tensors[f"{prefix}.gate_proj.weight"] = w13[expert_id, :INTERMEDIATE]
+            tensors[f"{prefix}.up_proj.weight"] = w13[expert_id, INTERMEDIATE:]
+            tensors[f"{prefix}.down_proj.weight"] = w2[expert_id]
     shard = tmp_path / "model-00001-of-00001.safetensors"
     save_file(tensors, shard)
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {name: shard.name for name in tensors}}),
         encoding="utf-8",
     )
-    return layer, tensors
+    return layers[0], tensors
 
 
 # -- Core cache behavior --
@@ -148,6 +150,65 @@ def test_storage_backed_reactive_and_predicted_paths(tmp_path):
     )
     provider.prepare(_topk([5]))
     assert provider.prefetch_useful == 1
+
+
+def test_horizon_moves_storage_then_hbm_before_deadline(tmp_path):
+    layers = ("layers.0.moe", "layers.1.moe", "layers.2.moe")
+    _make_storage_checkpoint(tmp_path, layers=layers)
+    trace = tmp_path / "routes.jsonl"
+    trace.write_text(
+        "\n".join(
+            json.dumps({"step": 0, "layer": layer, "experts": [expert_id]})
+            for layer, expert_id in zip(layers, (0, 2, 5))
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    coordinator = ExpertPrefetchCoordinator(
+        trace_path=str(trace),
+        trace_output=None,
+        lookahead=2,
+        budget_mb=1,
+        max_inflight_mb=2,
+        storage_budget_mb=2,
+        storage_max_inflight_mb=2,
+        storage_workers=2,
+    )
+
+    def make_provider(layer: str) -> CachedWeightProvider:
+        return CachedWeightProvider(
+            capacity=4,
+            w13_weight=torch.empty(
+                4,
+                2 * INTERMEDIATE,
+                HIDDEN,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+            w2_weight=torch.empty(
+                4,
+                HIDDEN,
+                INTERMEDIATE,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+            layer_name=layer,
+            prefetch_coordinator=coordinator,
+            num_experts=8,
+            storage_path=str(tmp_path),
+            host_capacity=4,
+        )
+
+    first, middle, target = (make_provider(layer) for layer in layers)
+    first.begin_forward([0])
+    for future, _ in coordinator._storage_inflight:
+        future.result()
+    middle.begin_forward([2])
+    target.prepare(_topk([5]))
+    assert target.misses == 0
+    assert target.prefetch_useful == 1
+    assert target.storage_misses == 0
+    coordinator.close()
 
 
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
