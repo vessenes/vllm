@@ -530,6 +530,13 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     moe_expert_cache_size: int = OffloadConfig.moe_expert_cache_size
     moe_expert_cache_split: str = OffloadConfig.moe_expert_cache_split
+    moe_expert_prefetch_trace: str | None = OffloadConfig.moe_expert_prefetch_trace
+    moe_expert_trace_output: str | None = OffloadConfig.moe_expert_trace_output
+    moe_expert_prefetch_lookahead: int = OffloadConfig.moe_expert_prefetch_lookahead
+    moe_expert_prefetch_budget_mb: float = OffloadConfig.moe_expert_prefetch_budget_mb
+    moe_expert_prefetch_max_inflight_mb: float = (
+        OffloadConfig.moe_expert_prefetch_max_inflight_mb
+    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1282,6 +1289,26 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--moe-expert-cache-split", **offload_kwargs["moe_expert_cache_split"]
+        )
+        offload_group.add_argument(
+            "--moe-expert-prefetch-trace",
+            **offload_kwargs["moe_expert_prefetch_trace"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-trace-output",
+            **offload_kwargs["moe_expert_trace_output"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-prefetch-lookahead",
+            **offload_kwargs["moe_expert_prefetch_lookahead"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-prefetch-budget-mb",
+            **offload_kwargs["moe_expert_prefetch_budget_mb"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-prefetch-max-inflight-mb",
+            **offload_kwargs["moe_expert_prefetch_max_inflight_mb"],
         )
 
         # Multimodal related configs
@@ -2459,6 +2486,13 @@ class EngineArgs:
             ),
             moe_expert_cache_size=self.moe_expert_cache_size,
             moe_expert_cache_split=self.moe_expert_cache_split,
+            moe_expert_prefetch_trace=self.moe_expert_prefetch_trace,
+            moe_expert_trace_output=self.moe_expert_trace_output,
+            moe_expert_prefetch_lookahead=self.moe_expert_prefetch_lookahead,
+            moe_expert_prefetch_budget_mb=self.moe_expert_prefetch_budget_mb,
+            moe_expert_prefetch_max_inflight_mb=(
+                self.moe_expert_prefetch_max_inflight_mb
+            ),
         )
 
         if self.gdn_prefill_backend is not None:

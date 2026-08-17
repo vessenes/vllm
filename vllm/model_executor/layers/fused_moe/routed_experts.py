@@ -277,6 +277,9 @@ class RoutedExperts(PluggableLayer):
                 "terms (fused_experts() receives w1/w2 only, not bias). "
                 f"Layer: {self.layer_name}."
             )
+        from vllm.model_executor.layers.fused_moe.expert_prefetch import (
+            get_expert_prefetch_coordinator,
+        )
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
             CachedWeightProvider,
         )
@@ -298,6 +301,7 @@ class RoutedExperts(PluggableLayer):
             w2_scale = None
 
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
+        offload_config = get_current_vllm_config().offload_config
         provider = CachedWeightProvider(
             capacity=capacity,
             w13_weight=cast(torch.Tensor, self.w13_weight).data,
@@ -305,6 +309,8 @@ class RoutedExperts(PluggableLayer):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             split=self._moe_expert_cache_split,
+            layer_name=self.layer_name,
+            prefetch_coordinator=get_expert_prefetch_coordinator(offload_config),
         )
         self.expert_weight_provider = provider
 

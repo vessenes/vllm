@@ -5,6 +5,10 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.expert_prefetch import (
+    ExpertPrefetchCoordinator,
+    ExpertPrefetchSchedule,
+)
 from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
     CachedWeightProvider,
     ExpertWeightResult,
@@ -308,6 +312,159 @@ def test_cpu_backing_is_pinned():
     provider, *_ = _make_provider()
     assert provider._cpu_w13.is_pinned()
     assert provider._cpu_w2.is_pinned()
+
+
+# -- Predictive prefetch --
+
+
+def test_async_prefetch_is_a_useful_demand_hit():
+    """A predicted copy completes before its slot is handed to the kernel."""
+    provider, w13, w2, _ = _make_provider(capacity=4)
+    stream = torch.cuda.Stream()
+    experts = [2, 5]
+
+    outcome = provider.prefetch(
+        experts,
+        deadline=4,
+        max_bytes=2 * provider.bytes_per_expert,
+        stream=stream,
+    )
+    result = provider.prepare(_topk(experts))
+    torch.accelerator.synchronize()
+
+    assert outcome.loaded == 2
+    assert outcome.bytes_enqueued == 2 * provider.bytes_per_expert
+    assert provider.prefetch_useful == 2
+    assert provider.hits == 2
+    assert provider.misses == 0
+    for expert_id in experts:
+        slot = provider._lru[expert_id][0]
+        torch.testing.assert_close(result.w1[slot].cpu(), w13[expert_id])
+        torch.testing.assert_close(result.w2[slot].cpu(), w2[expert_id])
+
+
+def test_prefetch_never_exceeds_byte_budget():
+    """Admission stops before the next complete expert would exceed budget."""
+    provider, *_ = _make_provider(capacity=4)
+    outcome = provider.prefetch(
+        [0, 1, 2],
+        deadline=4,
+        max_bytes=provider.bytes_per_expert,
+        stream=torch.cuda.Stream(),
+    )
+
+    assert outcome.loaded == 1
+    assert outcome.bytes_enqueued == provider.bytes_per_expert
+    assert outcome.resident == 1
+
+
+def test_nearer_prediction_survives_later_admission():
+    """A later prediction can replace only a prediction with a later deadline."""
+    provider, *_ = _make_provider(capacity=2)
+    stream = torch.cuda.Stream()
+    budget = provider.bytes_per_expert
+    provider.prefetch([0], deadline=2, max_bytes=budget, stream=stream)
+    provider.prefetch([1], deadline=5, max_bytes=budget, stream=stream)
+    torch.accelerator.synchronize()
+
+    provider.prefetch([2], deadline=3, max_bytes=budget, stream=stream)
+
+    assert 0 in provider._lru
+    assert 2 in provider._lru
+    assert 1 not in provider._lru
+
+
+def test_early_cache_use_preserves_future_prediction():
+    """A locality hit before the forecast deadline keeps its reservation."""
+    provider, *_ = _make_provider(capacity=2)
+    provider.prefetch(
+        [4],
+        deadline=5,
+        max_bytes=provider.bytes_per_expert,
+        stream=torch.cuda.Stream(),
+    )
+    provider.expire_predictions(2, {4})
+    provider.prepare(_topk([4]))
+
+    assert provider._reserved_deadlines[4] == [5]
+
+    provider.expire_predictions(5, {4})
+    provider.prepare(_topk([4]))
+    assert 4 not in provider._reserved_deadlines
+
+
+def test_repeated_future_expert_keeps_each_deadline():
+    """Two predicted uses of one expert survive the first predicted demand."""
+    provider, *_ = _make_provider(capacity=2)
+    stream = torch.cuda.Stream()
+    provider.prefetch(
+        [4],
+        deadline=2,
+        max_bytes=provider.bytes_per_expert,
+        stream=stream,
+    )
+    provider.prefetch(
+        [4],
+        deadline=5,
+        max_bytes=provider.bytes_per_expert,
+        stream=stream,
+    )
+
+    provider.expire_predictions(2, {4})
+    provider.prepare(_topk([4]))
+    assert provider._reserved_deadlines[4] == [5]
+
+    provider.expire_predictions(5, {4})
+    provider.prepare(_topk([4]))
+    assert 4 not in provider._reserved_deadlines
+    assert provider.prefetch_useful == 2
+
+
+def test_trace_schedule_drives_next_layer_prefetch(tmp_path):
+    """The coordinator fills the next layer without waiting for its router."""
+    trace = tmp_path / "routes.jsonl"
+    trace.write_text(
+        '{"step":0,"layer":"layers.0.moe","experts":[0]}\n'
+        '{"step":0,"layer":"layers.1.moe","experts":[3]}\n',
+        encoding="utf-8",
+    )
+    schedule = ExpertPrefetchSchedule(str(trace))
+    assert schedule.get(0, "layers.1.moe") == (3,)
+
+    first_weights = _make_weights(8, torch.bfloat16)
+    second_weights = _make_weights(8, torch.bfloat16)
+    coordinator = ExpertPrefetchCoordinator(
+        trace_path=str(trace),
+        trace_output=None,
+        lookahead=1,
+        budget_mb=1,
+        max_inflight_mb=1,
+    )
+    first = CachedWeightProvider(
+        capacity=4,
+        w13_weight=first_weights[0],
+        w2_weight=first_weights[1],
+        layer_name="layers.0.moe",
+        prefetch_coordinator=coordinator,
+    )
+    second = CachedWeightProvider(
+        capacity=4,
+        w13_weight=second_weights[0],
+        w2_weight=second_weights[1],
+        layer_name="layers.1.moe",
+        prefetch_coordinator=coordinator,
+    )
+
+    first.begin_forward([0])
+    result = second.prepare(_topk([3]))
+    torch.accelerator.synchronize()
+
+    assert 3 in second._lru
+    assert second.prefetch_useful == 1
+    assert second.misses == 0
+    slot = second._lru[3][0]
+    torch.testing.assert_close(result.w1[slot].cpu(), second_weights[0][3])
+    coordinator.close()
 
 
 # -- Expert-group execution --

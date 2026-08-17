@@ -146,6 +146,15 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "token" (default) reproduces the uncached output exactly;
             "expert" is much cheaper at small cache sizes but differs at
             rounding level.
+        moe_expert_prefetch_trace: JSONL route trace used as an oracle expert
+            prediction schedule.
+        moe_expert_trace_output: JSONL path for recording observed expert sets.
+        moe_expert_prefetch_lookahead: Number of future MoE calls visible to
+            the trace-driven horizon allocator.
+        moe_expert_prefetch_budget_mb: Maximum MiB of predicted expert copies
+            enqueued at each MoE call.
+        moe_expert_prefetch_max_inflight_mb: Maximum MiB of predicted expert
+            copies outstanding on H2D streams. Zero disables this second cap.
         enforce_eager: Whether to enforce eager execution. If True, we will
             disable CUDA graph and always execute the model in eager mode.
             If False, we will use CUDA graph and eager execution in hybrid.
@@ -210,6 +219,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         offload_params: set[str] | None = None,
         moe_expert_cache_size: int = 0,
         moe_expert_cache_split: str = "token",
+        moe_expert_prefetch_trace: str | None = None,
+        moe_expert_trace_output: str | None = None,
+        moe_expert_prefetch_lookahead: int = 0,
+        moe_expert_prefetch_budget_mb: float = 0,
+        moe_expert_prefetch_max_inflight_mb: float = 0,
         enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
         disable_custom_all_reduce: bool = False,
@@ -328,6 +342,11 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             offload_params=offload_params or set(),
             moe_expert_cache_size=moe_expert_cache_size,
             moe_expert_cache_split=moe_expert_cache_split,
+            moe_expert_prefetch_trace=moe_expert_prefetch_trace,
+            moe_expert_trace_output=moe_expert_trace_output,
+            moe_expert_prefetch_lookahead=moe_expert_prefetch_lookahead,
+            moe_expert_prefetch_budget_mb=moe_expert_prefetch_budget_mb,
+            moe_expert_prefetch_max_inflight_mb=(moe_expert_prefetch_max_inflight_mb),
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
             disable_custom_all_reduce=disable_custom_all_reduce,

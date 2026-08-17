@@ -8,6 +8,11 @@ experts in a fixed-size GPU scratch buffer.
 | --- | --- | --- |
 | `--moe-expert-cache-size N` | `0` (disabled) | Number of expert slots to allocate in the GPU buffer per layer |
 | `--moe-expert-cache-split` | `token` | How to evaluate a forward that needs more experts than the cache holds: `token` or `expert` |
+| `--moe-expert-trace-output PATH` | unset | Record observed per-forward expert sets as JSONL |
+| `--moe-expert-prefetch-trace PATH` | unset | Replay a JSONL trace as an oracle prediction schedule |
+| `--moe-expert-prefetch-lookahead N` | `0` | Future MoE calls visible to the horizon allocator |
+| `--moe-expert-prefetch-budget-mb N` | `0` | Maximum MiB enqueued by the allocator at each MoE call |
+| `--moe-expert-prefetch-max-inflight-mb N` | `0` | Maximum outstanding predicted H2D MiB; zero disables this second cap |
 
 !!! note
     Expert caching is not compatible with expert parallelism (EP > 1),
@@ -39,6 +44,46 @@ llm = LLM(
 
 The cache is implemented as a `CachedWeightProvider` — the kernel does not
 know or care where weights came from.
+
+### Trace-driven prefetch
+
+An observed route trace can stand in for a trained predictor while evaluating
+the transfer and residency mechanism. First record a deterministic request:
+
+```bash
+vllm serve MODEL \
+    --moe-expert-cache-size 16 \
+    --moe-expert-trace-output /tmp/routes.jsonl
+```
+
+Replay the same request and generation settings with the trace enabled:
+
+```bash
+vllm serve MODEL \
+    --moe-expert-cache-size 16 \
+    --moe-expert-prefetch-trace /tmp/routes.jsonl \
+    --moe-expert-prefetch-lookahead 16 \
+    --moe-expert-prefetch-budget-mb 128 \
+    --moe-expert-prefetch-max-inflight-mb 512
+```
+
+Each JSONL record identifies a layer-local forward, not an individual token:
+
+```json
+{"step":0,"layer":"model.layers.1.mlp.experts","experts":[3,17,42,51]}
+```
+
+The allocator scans the future events in deadline order. It fills the measured
+per-call byte budget without exceeding it, protects nearer predictions from
+later admissions, and limits queued copies with the optional in-flight cap.
+Copies run on a dedicated CUDA stream; the demand stream waits on an event only
+when it reaches a predicted expert whose copy is still running. Routing remains
+authoritative: an incorrect trace entry changes cache preparation, never the
+router's selected expert IDs.
+
+The final log reports bytes enqueued, useful and wasted predictions, demand
+waits, and budget or capacity blocks. Derive the byte budget from measured H2D
+bandwidth and the compute interval available between allocator invocations.
 
 ### How it works
 

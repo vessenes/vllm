@@ -20,7 +20,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+    ExpertWeightResult,
+    run_with_expert_cache,
+)
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -51,6 +56,20 @@ logger = init_logger(__name__)
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     """W8A8 FP8 MoE quantization using compressed tensors."""
+
+    @property
+    def supports_expert_lru_cache(self) -> bool:
+        # Slot remapping requires the first tensor dimension to remain the
+        # expert dimension. These backends consume the canonical layout;
+        # other FP8 backends repack or shuffle it during model loading.
+        compatible_backends = {
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.BATCHED_TRITON,
+            Fp8MoeBackend.VLLM_CUTLASS,
+            Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+            Fp8MoeBackend.XPU,
+        }
+        return self.fp8_backend in compatible_backends
 
     def __init__(
         self,
@@ -153,13 +172,25 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        # With incremental expert offload enabled, construct the full expert
+        # store directly in pinned host memory. vLLM initializes modules under
+        # a CUDA device context, so the explicit CPU device is required. This
+        # avoids ever materializing the complete MoE checkpoint in HBM.
+        expert_weights_on_cpu = getattr(layer, "_moe_expert_cache_size", 0) > 0
+
+        def _empty_expert_weight(*shape: int) -> torch.Tensor:
+            if expert_weights_on_cpu:
+                return torch.empty(
+                    *shape, dtype=params_dtype, device="cpu"
+                ).pin_memory()
+            return torch.empty(*shape, dtype=params_dtype)
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            _empty_expert_weight(
                 num_experts,
                 w13_num_shards * intermediate_size_per_partition,
                 hidden_size,
-                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -167,11 +198,10 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            _empty_expert_weight(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -325,6 +355,10 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
 
+        # Install the slot-indexed weights and scales before constructing the
+        # quant config: it captures scale tensor references used by the kernel.
+        layer._maybe_init_expert_lru_cache("weight_scale")
+
         # Setup modular kernel for TP case and naive DP/EP case.
         # In non-naive DP/EP case, we will create a ModularKernelMethod.
         # TODO(rob): unify these so FP8MoEMethod owns the ModularKernel
@@ -399,6 +433,36 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = layer.expert_weight_provider
+        if provider is not None:
+
+            def run(
+                result: ExpertWeightResult, rows: slice, include_shared: bool
+            ) -> torch.Tensor:
+                assert self.moe_kernel is not None
+                return self.moe_kernel.apply(
+                    x[rows],
+                    result.w1,
+                    result.w2,
+                    topk_weights[rows],
+                    topk_ids[rows],
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    expert_map=result.expert_map,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    # Shared experts belong to the whole forward, not each
+                    # cache split generated to fit the routed expert set.
+                    shared_experts=shared_experts if include_shared else None,
+                    shared_experts_input=(
+                        shared_experts_input[rows]
+                        if include_shared and shared_experts_input is not None
+                        else None
+                    ),
+                )
+
+            return run_with_expert_cache(provider, topk_ids, run)
+
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,

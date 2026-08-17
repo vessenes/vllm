@@ -330,13 +330,25 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
         # Let PrepareAndFinalize::finalize() decide the impl.
         return TopKWeightAndReduceDelegate()
 
-    def _get_permute_scratch(self) -> MoEPermuteScratch | None:
+    def _get_permute_scratch(
+        self, physical_num_experts: int | None = None
+    ) -> MoEPermuteScratch | None:
+        num_local_experts = (
+            physical_num_experts
+            if physical_num_experts is not None
+            else self.moe_config.num_local_experts
+        )
+        if (
+            self._permute_scratch is not None
+            and self._permute_scratch.num_local_experts != num_local_experts
+        ):
+            self._permute_scratch = None
         if self._permute_scratch is None and moe_permute_unpermute_supported():
             self._permute_scratch = MoEPermuteScratch(
                 max_num_tokens=self.moe_config.max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
-                num_local_experts=self.moe_config.num_local_experts,
+                num_local_experts=num_local_experts,
                 device=torch.device(self.moe_config.device),
             )
         return self._permute_scratch
@@ -396,7 +408,7 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
             self.per_out_ch_quant,
             use_batched_format,
             topk_weights,
-            self._get_permute_scratch(),
+            self._get_permute_scratch(w1.size(0)),
         )
 
 

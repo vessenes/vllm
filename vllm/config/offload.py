@@ -109,9 +109,42 @@ class OffloadConfig:
       model dtype before being summed, so results differ from the uncached
       path at rounding level."""
 
+    moe_expert_prefetch_trace: str | None = None
+    """JSONL route trace used as an oracle prediction schedule."""
+
+    moe_expert_trace_output: str | None = None
+    """Write observed per-forward expert sets to this JSONL path."""
+
+    moe_expert_prefetch_lookahead: int = Field(default=0, ge=0)
+    """Maximum number of future MoE calls considered by the allocator."""
+
+    moe_expert_prefetch_budget_mb: float = Field(default=0, ge=0)
+    """Maximum MiB of predicted expert copies enqueued at each MoE call."""
+
+    moe_expert_prefetch_max_inflight_mb: float = Field(default=0, ge=0)
+    """Maximum MiB of predicted expert copies outstanding on H2D streams.
+    Zero leaves the per-call budget as the only transfer bound."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        predictive = self.moe_expert_prefetch_trace is not None
+        if predictive and self.moe_expert_cache_size == 0:
+            raise ValueError(
+                "moe_expert_prefetch_trace requires moe_expert_cache_size > 0"
+            )
+        if predictive and self.moe_expert_prefetch_lookahead == 0:
+            raise ValueError(
+                "moe_expert_prefetch_trace requires moe_expert_prefetch_lookahead > 0"
+            )
+        if predictive and self.moe_expert_prefetch_budget_mb == 0:
+            raise ValueError(
+                "moe_expert_prefetch_trace requires moe_expert_prefetch_budget_mb > 0"
+            )
+        if self.moe_expert_trace_output and self.moe_expert_cache_size == 0:
+            raise ValueError(
+                "moe_expert_trace_output requires moe_expert_cache_size > 0"
+            )
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(
