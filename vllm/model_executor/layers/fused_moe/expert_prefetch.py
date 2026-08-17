@@ -143,6 +143,8 @@ class ExpertPrefetchCoordinator:
             self._trace_handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
         if self.schedule is None or layer_name not in self.schedule.layer_order:
+            if self._observations % _SUMMARY_INTERVAL == 0:
+                self.log_summary()
             return
 
         layer_count = len(self.schedule.layer_order)
