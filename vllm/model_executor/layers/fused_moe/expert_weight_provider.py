@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -65,6 +67,17 @@ class ExpertWeightResult:
     w2_scale: torch.Tensor | None = None
 
 
+@dataclass
+class StoragePrefetchOutcome:
+    """Result of admitting predicted NVMe-to-pinned-RAM transfers."""
+
+    requested: int
+    resident: int
+    loaded: int
+    bytes_enqueued: int
+    futures: list[Future[int]]
+
+
 class CachedWeightProvider:
     """GPU LRU cache backed by CPU pinned memory.
 
@@ -94,8 +107,17 @@ class CachedWeightProvider:
         split: MoECacheSplit = "token",
         layer_name: str = "",
         prefetch_coordinator: ExpertPrefetchCoordinator | None = None,
+        num_experts: int | None = None,
+        storage_path: str | None = None,
+        host_capacity: int = 0,
     ) -> None:
-        num_experts = w13_weight.size(0)
+        source_experts = w13_weight.size(0)
+        num_experts = num_experts or source_experts
+        if storage_path is not None and source_experts != capacity:
+            raise ValueError(
+                "Storage-backed expert weights must be allocated as physical "
+                f"HBM slots ({source_experts} rows != capacity {capacity})"
+            )
 
         self.capacity = capacity
         self.split: MoECacheSplit = split
@@ -107,6 +129,11 @@ class CachedWeightProvider:
         self.prefetch_waits = 0
         self.prefetch_loaded = 0
         self.prefetch_bytes = 0
+        self.storage_hits = 0
+        self.storage_misses = 0
+        self.storage_prefetch_loaded = 0
+        self.storage_prefetch_bytes = 0
+        self.storage_prefetch_waits = 0
         self._prepare_calls = 0
         self.layer_name = layer_name
         self._prefetch_coordinator = prefetch_coordinator
@@ -115,40 +142,83 @@ class CachedWeightProvider:
             cuda_device = torch.accelerator.current_accelerator()
         else:
             cuda_device = w13_weight.device
-        self._cpu_w13: torch.Tensor = _pinned_cpu_copy(w13_weight)
-        self._cpu_w2: torch.Tensor = _pinned_cpu_copy(w2_weight)
+        self._storage = None
+        self._host_capacity = 0
+        if storage_path is None:
+            self._cpu_w13 = _pinned_cpu_copy(w13_weight)
+            self._cpu_w2 = _pinned_cpu_copy(w2_weight)
+            self._buf_w13 = torch.empty(
+                capacity,
+                *w13_weight.shape[1:],
+                dtype=w13_weight.dtype,
+                device=cuda_device,
+            )
+            self._buf_w2 = torch.empty(
+                capacity,
+                *w2_weight.shape[1:],
+                dtype=w2_weight.dtype,
+                device=cuda_device,
+            )
+        else:
+            from vllm.model_executor.layers.fused_moe.expert_storage import (
+                get_safetensors_expert_store,
+            )
 
-        self._buf_w13: torch.Tensor = torch.empty(
-            capacity,
-            *w13_weight.shape[1:],
-            dtype=w13_weight.dtype,
-            device=cuda_device,
-        )
-        self._buf_w2: torch.Tensor = torch.empty(
-            capacity,
-            *w2_weight.shape[1:],
-            dtype=w2_weight.dtype,
-            device=cuda_device,
-        )
+            self._storage = get_safetensors_expert_store(storage_path)
+            self._host_capacity = min(host_capacity, num_experts)
+            self._cpu_w13 = torch.empty(
+                self._host_capacity,
+                *w13_weight.shape[1:],
+                dtype=w13_weight.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._cpu_w2 = torch.empty(
+                self._host_capacity,
+                *w2_weight.shape[1:],
+                dtype=w2_weight.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._buf_w13 = w13_weight
+            self._buf_w2 = w2_weight
         self.device = self._buf_w13.device
 
         if w13_scale is not None and w2_scale is not None:
             # Pinned for the same reason the weights are: these are copied on
             # every miss, and pageable source memory forces a staging copy.
-            self._cpu_w13_scale: torch.Tensor | None = _pinned_cpu_copy(w13_scale)
-            self._cpu_w2_scale: torch.Tensor | None = _pinned_cpu_copy(w2_scale)
-            self._buf_w13_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w13_scale.shape[1:],
-                dtype=w13_scale.dtype,
-                device=cuda_device,
-            )
-            self._buf_w2_scale: torch.Tensor | None = torch.empty(
-                capacity,
-                *w2_scale.shape[1:],
-                dtype=w2_scale.dtype,
-                device=cuda_device,
-            )
+            if storage_path is None:
+                self._cpu_w13_scale = _pinned_cpu_copy(w13_scale)
+                self._cpu_w2_scale = _pinned_cpu_copy(w2_scale)
+                self._buf_w13_scale = torch.empty(
+                    capacity,
+                    *w13_scale.shape[1:],
+                    dtype=w13_scale.dtype,
+                    device=cuda_device,
+                )
+                self._buf_w2_scale = torch.empty(
+                    capacity,
+                    *w2_scale.shape[1:],
+                    dtype=w2_scale.dtype,
+                    device=cuda_device,
+                )
+            else:
+                self._cpu_w13_scale = torch.empty(
+                    self._host_capacity,
+                    *w13_scale.shape[1:],
+                    dtype=w13_scale.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._cpu_w2_scale = torch.empty(
+                    self._host_capacity,
+                    *w2_scale.shape[1:],
+                    dtype=w2_scale.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._buf_w13_scale = w13_scale
+                self._buf_w2_scale = w2_scale
         else:
             self._cpu_w13_scale = None
             self._cpu_w2_scale = None
@@ -167,6 +237,16 @@ class CachedWeightProvider:
         self._slot_last_use: dict[int, torch.cuda.Event] = {}
         self._reserved_deadlines: dict[int, list[int]] = {}
         self._current_ordinal: int | None = None
+
+        # Bounded storage -> pinned-RAM cache. Entries are reserved before a
+        # worker starts and published by completion of the corresponding
+        # future. CUDA events protect pinned slots until H2D DMA is finished.
+        self._host_lru: dict[int, list] = {}
+        self._host_clock = 0
+        self._host_free_slots = list(range(self._host_capacity))
+        self._host_pending: dict[int, Future[int]] = {}
+        self._host_slot_last_use: dict[int, torch.cuda.Event] = {}
+        self._host_lock = threading.Lock()
 
         # Expert map handed to the kernel: expert id to slot for the group
         # being evaluated, -1 for everything else. Rebuilt each prepare() --
@@ -192,6 +272,19 @@ class CachedWeightProvider:
             assert self._cpu_w2_scale is not None
             tensors.extend((self._cpu_w13_scale, self._cpu_w2_scale))
         return sum(t[0].numel() * t.element_size() for t in tensors)
+
+    @property
+    def has_storage_backing(self) -> bool:
+        return self._storage is not None
+
+    def contains_all(self, expert_ids: tuple[int, ...]) -> bool:
+        return all(expert_id in self._lru for expert_id in expert_ids)
+
+    def host_contains_all(self, expert_ids: tuple[int, ...]) -> bool:
+        if self._storage is None:
+            return True
+        with self._host_lock:
+            return all(expert_id in self._host_lru for expert_id in expert_ids)
 
     @property
     def buf_w13(self) -> torch.Tensor:
@@ -289,22 +382,217 @@ class CachedWeightProvider:
         self.prefetch_wasted += len(self._reserved_deadlines.pop(victim, []))
         return self._lru.pop(victim)[0]
 
-    def _copy_expert(self, expert_id: int, slot: int) -> None:
+    def _host_eviction_key(self, expert_id: int) -> tuple[float, float, float]:
+        _, freq, last = self._host_lru[expert_id]
+        score = freq / (self._host_clock - last + 1)
+        deadlines = self._reserved_deadlines.get(expert_id)
+        if not deadlines:
+            return (0.0, 0.0, score)
+        return (1.0, -float(deadlines[0]), score)
+
+    def _take_host_slot_locked(
+        self, needed: set[int], speculative_deadline: int | None
+    ) -> int | None:
+        if self._host_free_slots:
+            return self._host_free_slots.pop()
+        candidates = [
+            expert_id
+            for expert_id in self._host_lru
+            if expert_id not in needed and expert_id not in self._host_pending
+        ]
+        if speculative_deadline is not None:
+            candidates = [
+                expert_id
+                for expert_id in candidates
+                if expert_id not in self._reserved_deadlines
+                or self._reserved_deadlines[expert_id][0] > speculative_deadline
+            ]
+        if not candidates:
+            return None
+        victim = min(candidates, key=self._host_eviction_key)
+        return self._host_lru.pop(victim)[0]
+
+    def _load_host_slot(self, expert_id: int, slot: int) -> int:
+        assert self._storage is not None
+        with self._host_lock:
+            last_use = self._host_slot_last_use.pop(slot, None)
+        if last_use is not None:
+            last_use.synchronize()
+        return self._storage.load_expert(
+            layer_name=self.layer_name,
+            expert_id=expert_id,
+            w13=self._cpu_w13[slot],
+            w2=self._cpu_w2[slot],
+            w13_scale=(
+                self._cpu_w13_scale[slot] if self._cpu_w13_scale is not None else None
+            ),
+            w2_scale=(
+                self._cpu_w2_scale[slot] if self._cpu_w2_scale is not None else None
+            ),
+        )
+
+    def _reap_host_pending(self) -> None:
+        if self._storage is None:
+            return
+        completed: list[tuple[int, Future[int]]] = []
+        with self._host_lock:
+            for expert_id, future in list(self._host_pending.items()):
+                if future.done():
+                    completed.append((expert_id, future))
+                    del self._host_pending[expert_id]
+        for expert_id, future in completed:
+            try:
+                future.result()
+            except Exception:
+                with self._host_lock:
+                    entry = self._host_lru.pop(expert_id, None)
+                    if entry is not None:
+                        self._host_free_slots.append(entry[0])
+                raise
+
+    def _host_is_ready(self, expert_id: int) -> bool:
+        if self._storage is None:
+            return True
+        with self._host_lock:
+            future = self._host_pending.get(expert_id)
+            return expert_id in self._host_lru and (
+                future is None or (future.done() and future.exception() is None)
+            )
+
+    def _ensure_host(self, expert_id: int, needed: set[int]) -> int:
+        if self._storage is None:
+            return expert_id
+        self._reap_host_pending()
+        future: Future[int] | None
+        with self._host_lock:
+            entry = self._host_lru.get(expert_id)
+            future = self._host_pending.get(expert_id)
+        if entry is not None:
+            if future is not None:
+                self.storage_prefetch_waits += 1
+                try:
+                    future.result()
+                except Exception:
+                    with self._host_lock:
+                        self._host_pending.pop(expert_id, None)
+                        failed = self._host_lru.pop(expert_id, None)
+                        if failed is not None:
+                            self._host_free_slots.append(failed[0])
+                    raise
+                with self._host_lock:
+                    self._host_pending.pop(expert_id, None)
+            with self._host_lock:
+                self._host_clock += 1
+                entry = self._host_lru[expert_id]
+                entry[1] += 1
+                entry[2] = self._host_clock
+                slot = entry[0]
+            self.storage_hits += 1
+            return slot
+
+        with self._host_lock:
+            slot = self._take_host_slot_locked(needed, speculative_deadline=None)
+            if slot is None:
+                raise RuntimeError(
+                    "Pinned expert cache has no evictable slot; increase "
+                    "--moe-expert-host-cache-size"
+                )
+            self._host_clock += 1
+            self._host_lru[expert_id] = [slot, 1, self._host_clock]
+        try:
+            self._load_host_slot(expert_id, slot)
+        except Exception:
+            with self._host_lock:
+                self._host_lru.pop(expert_id, None)
+                self._host_free_slots.append(slot)
+            raise
+        self.storage_misses += 1
+        return slot
+
+    @torch.compiler.disable
+    def prefetch_host(
+        self,
+        unique_ids: list[int],
+        *,
+        deadline: int,
+        max_bytes: int,
+        executor: ThreadPoolExecutor,
+    ) -> StoragePrefetchOutcome:
+        """Admit predicted storage reads without blocking the model thread."""
+        if self._storage is None:
+            return StoragePrefetchOutcome(len(unique_ids), len(unique_ids), 0, 0, [])
+        self._reap_host_pending()
+        unique_ids = list(dict.fromkeys(unique_ids))
+        requested = len(unique_ids)
+        resident = 0
+        loaded = 0
+        futures: list[Future[int]] = []
+        remaining = max_bytes
+        needed = set(unique_ids)
+        for expert_id in unique_ids:
+            if not 0 <= expert_id < self._num_experts:
+                raise ValueError(
+                    f"Predicted expert {expert_id} outside [0, {self._num_experts})"
+                )
+            with self._host_lock:
+                present = expert_id in self._host_lru
+            if present:
+                self._reserve(expert_id, deadline)
+                resident += 1
+                continue
+            if self.bytes_per_expert > remaining:
+                break
+            with self._host_lock:
+                slot = self._take_host_slot_locked(
+                    needed, speculative_deadline=deadline
+                )
+                if slot is None:
+                    break
+                self._host_clock += 1
+                self._host_lru[expert_id] = [slot, 0, self._host_clock]
+                future = executor.submit(self._load_host_slot, expert_id, slot)
+                self._host_pending[expert_id] = future
+            self._reserve(expert_id, deadline)
+            futures.append(future)
+            resident += 1
+            loaded += 1
+            remaining -= self.bytes_per_expert
+
+        byte_count = loaded * self.bytes_per_expert
+        self.storage_prefetch_loaded += loaded
+        self.storage_prefetch_bytes += byte_count
+        return StoragePrefetchOutcome(
+            requested=requested,
+            resident=resident,
+            loaded=loaded,
+            bytes_enqueued=byte_count,
+            futures=futures,
+        )
+
+    def _copy_expert(
+        self, expert_id: int, slot: int, host_needed: set[int] | None = None
+    ) -> None:
+        source_slot = self._ensure_host(expert_id, host_needed or {expert_id})
         last_use = self._slot_last_use.pop(slot, None)
         if last_use is not None:
             torch.cuda.current_stream(self.device).wait_event(last_use)
-        self._buf_w13[slot].copy_(self._cpu_w13[expert_id], non_blocking=True)
-        self._buf_w2[slot].copy_(self._cpu_w2[expert_id], non_blocking=True)
+        self._buf_w13[slot].copy_(self._cpu_w13[source_slot], non_blocking=True)
+        self._buf_w2[slot].copy_(self._cpu_w2[source_slot], non_blocking=True)
         if self._buf_w13_scale is not None:
             assert self._cpu_w13_scale is not None
             assert self._cpu_w2_scale is not None
             assert self._buf_w2_scale is not None
             self._buf_w13_scale[slot].copy_(
-                self._cpu_w13_scale[expert_id], non_blocking=True
+                self._cpu_w13_scale[source_slot], non_blocking=True
             )
             self._buf_w2_scale[slot].copy_(
-                self._cpu_w2_scale[expert_id], non_blocking=True
+                self._cpu_w2_scale[source_slot], non_blocking=True
             )
+        if self._storage is not None:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+            with self._host_lock:
+                self._host_slot_last_use[source_slot] = event
 
     def mark_used(self, expert_ids: list[int]) -> None:
         """Publish when the compute stream has finished reading cache slots."""
@@ -331,6 +619,7 @@ class CachedWeightProvider:
     ) -> PrefetchOutcome:
         """Admit predicted experts and enqueue their copies on *stream*."""
         self._reap_pending()
+        self._reap_host_pending()
         unique_ids = list(dict.fromkeys(unique_ids))
         requested = len(unique_ids)
         resident = 0
@@ -344,7 +633,11 @@ class CachedWeightProvider:
                 self._reserve(expert_id, deadline)
                 resident += 1
             else:
-                missing.append(expert_id)
+                # Storage reads run on CPU workers. Never turn an HBM
+                # prediction into a synchronous NVMe wait: a later allocator
+                # tick will promote it after the pinned tier is ready.
+                if self._host_is_ready(expert_id):
+                    missing.append(expert_id)
 
         remaining = max_bytes
         loaded: list[int] = []
@@ -356,7 +649,7 @@ class CachedWeightProvider:
                 slot = self._take_slot(needed, speculative_deadline=deadline)
                 if slot is None:
                     break
-                self._copy_expert(expert_id, slot)
+                self._copy_expert(expert_id, slot, needed)
                 self._clock += 1
                 self._lru[expert_id] = [slot, 0, self._clock]
                 self._reserve(expert_id, deadline)
@@ -539,7 +832,7 @@ class CachedWeightProvider:
                 # len(unique_ids) <= capacity guarantees that some slot is
                 # available once any pending speculative copy is completed.
                 assert slot is not None
-                self._copy_expert(expert_id, slot)
+                self._copy_expert(expert_id, slot, needed)
 
                 self._clock += 1
                 self._lru[expert_id] = [slot, 1, self._clock]

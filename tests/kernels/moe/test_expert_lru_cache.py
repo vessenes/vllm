@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for CachedWeightProvider (LFRU expert cache)."""
 
+import json
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from vllm.model_executor.layers.fused_moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
@@ -60,7 +64,90 @@ def _topk(ids: list[int]) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.int32, device="cuda").unsqueeze(0)
 
 
+def _make_storage_checkpoint(tmp_path, num_experts: int = 8):
+    layer = "layers.0.moe"
+    tensors = {}
+    for expert_id in range(num_experts):
+        prefix = f"{layer}.{expert_id}"
+        w13, w2 = _make_weights(num_experts, torch.bfloat16)
+        tensors[f"{prefix}.gate_proj.weight"] = w13[expert_id, :INTERMEDIATE]
+        tensors[f"{prefix}.up_proj.weight"] = w13[expert_id, INTERMEDIATE:]
+        tensors[f"{prefix}.down_proj.weight"] = w2[expert_id]
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    save_file(tensors, shard)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard.name for name in tensors}}),
+        encoding="utf-8",
+    )
+    return layer, tensors
+
+
 # -- Core cache behavior --
+
+
+def test_storage_backed_reactive_and_predicted_paths(tmp_path):
+    layer, source = _make_storage_checkpoint(tmp_path)
+    capacity = 4
+    provider = CachedWeightProvider(
+        capacity=capacity,
+        w13_weight=torch.empty(
+            capacity,
+            2 * INTERMEDIATE,
+            HIDDEN,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        w2_weight=torch.empty(
+            capacity,
+            HIDDEN,
+            INTERMEDIATE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        layer_name=layer,
+        num_experts=8,
+        storage_path=str(tmp_path),
+        host_capacity=4,
+    )
+
+    result = provider.prepare(_topk([1, 3]))
+    for expert_id in (1, 3):
+        slot = provider._lru[expert_id][0]
+        prefix = f"{layer}.{expert_id}"
+        expected_w13 = torch.cat(
+            (
+                source[f"{prefix}.gate_proj.weight"],
+                source[f"{prefix}.up_proj.weight"],
+            )
+        )
+        torch.testing.assert_close(result.w1[slot].cpu(), expected_w13)
+        torch.testing.assert_close(
+            result.w2[slot].cpu(), source[f"{prefix}.down_proj.weight"]
+        )
+    assert provider.storage_misses == 2
+
+    provider.invalidate(1)
+    provider.prepare(_topk([1]))
+    assert provider.storage_hits == 1
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        outcome = provider.prefetch_host(
+            [5],
+            deadline=10,
+            max_bytes=provider.bytes_per_expert,
+            executor=executor,
+        )
+        for future in outcome.futures:
+            future.result()
+    stream = torch.cuda.Stream()
+    provider.prefetch(
+        [5],
+        deadline=10,
+        max_bytes=provider.bytes_per_expert,
+        stream=stream,
+    )
+    provider.prepare(_topk([5]))
+    assert provider.prefetch_useful == 1
 
 
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)

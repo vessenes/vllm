@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lookahead", type=int, default=0)
     parser.add_argument("--budget-mb", type=float, default=0)
     parser.add_argument("--max-inflight-mb", type=float, default=0)
+    parser.add_argument("--expert-storage-path")
+    parser.add_argument("--host-cache-size", type=int, default=0)
+    parser.add_argument("--storage-budget-mb", type=float, default=0)
+    parser.add_argument("--storage-max-inflight-mb", type=float, default=0)
+    parser.add_argument("--storage-workers", type=int, default=4)
     parser.add_argument("--enforce-eager", action="store_true")
     return parser.parse_args()
 
@@ -48,6 +53,11 @@ def main() -> None:
         moe_expert_prefetch_lookahead=args.lookahead,
         moe_expert_prefetch_budget_mb=args.budget_mb,
         moe_expert_prefetch_max_inflight_mb=args.max_inflight_mb,
+        moe_expert_storage_path=args.expert_storage_path,
+        moe_expert_host_cache_size=args.host_cache_size,
+        moe_expert_storage_prefetch_budget_mb=args.storage_budget_mb,
+        moe_expert_storage_max_inflight_mb=args.storage_max_inflight_mb,
+        moe_expert_storage_workers=args.storage_workers,
         enforce_eager=args.enforce_eager,
     )
     init_seconds = time.perf_counter() - init_start
@@ -61,6 +71,16 @@ def main() -> None:
     request_output = llm.generate([args.prompt], sampling)[0]
     generate_seconds = time.perf_counter() - generate_start
     token_ids = request_output.outputs[0].token_ids
+    metrics = request_output.metrics
+    decode_seconds = None
+    decode_tokens_per_second = None
+    if (
+        metrics is not None
+        and len(token_ids) > 1
+        and metrics.last_token_ts > metrics.first_token_ts
+    ):
+        decode_seconds = metrics.last_token_ts - metrics.first_token_ts
+        decode_tokens_per_second = (len(token_ids) - 1) / decode_seconds
     token_bytes = ",".join(str(token_id) for token_id in token_ids).encode()
     result = {
         "model": args.model,
@@ -70,10 +90,20 @@ def main() -> None:
         "lookahead": args.lookahead,
         "budget_mb": args.budget_mb,
         "max_inflight_mb": args.max_inflight_mb,
+        "expert_storage_path": args.expert_storage_path,
+        "host_cache_size": args.host_cache_size,
+        "storage_budget_mb": args.storage_budget_mb,
+        "storage_max_inflight_mb": args.storage_max_inflight_mb,
+        "storage_workers": args.storage_workers,
         "init_seconds": init_seconds,
         "generate_seconds": generate_seconds,
         "output_tokens": len(token_ids),
         "output_tokens_per_second": len(token_ids) / generate_seconds,
+        "decode_seconds": decode_seconds,
+        "decode_tokens_per_second": decode_tokens_per_second,
+        "first_token_latency": (
+            metrics.first_token_latency if metrics is not None else None
+        ),
         "token_sha256": hashlib.sha256(token_bytes).hexdigest(),
         "finish_reason": request_output.outputs[0].finish_reason,
         "text_preview": request_output.outputs[0].text[:500],

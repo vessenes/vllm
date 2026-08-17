@@ -534,6 +534,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
+        offload_config = get_current_vllm_config().offload_config
+        allocation_experts = (
+            min(offload_config.moe_expert_cache_size, num_experts)
+            if offload_config.moe_expert_storage_path is not None
+            else num_experts
+        )
+
         assert self.quant_config.is_checkpoint_fp8_serialized
         params_dtype = torch.float8_e4m3fn
 
@@ -566,7 +573,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocation_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
@@ -578,7 +585,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocation_experts,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
@@ -610,18 +617,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if not self.block_quant:
             # For per-tensor quant, the scales are per expert and weight.
-            w13_scale_data = torch.ones(num_experts, 2, dtype=torch.float32)
-            w2_scale_data = torch.ones(num_experts, dtype=torch.float32)
+            w13_scale_data = torch.ones(allocation_experts, 2, dtype=torch.float32)
+            w2_scale_data = torch.ones(allocation_experts, dtype=torch.float32)
         else:
             # For block quant, the scales are per block (typically 128x128).
             w13_scale_data = torch.ones(
-                num_experts,
+                allocation_experts,
                 2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
             )
             w2_scale_data = torch.ones(
-                num_experts,
+                allocation_experts,
                 (hidden_size + block_n - 1) // block_n,
                 (intermediate_size_per_partition + block_k - 1) // block_k,
                 dtype=torch.float32,

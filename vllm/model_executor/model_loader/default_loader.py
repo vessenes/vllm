@@ -253,6 +253,14 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        from vllm.config import get_current_vllm_config
+
+        storage_path = get_current_vllm_config().offload_config.moe_expert_storage_path
+        skip_routed_experts = storage_path is not None
+        if skip_routed_experts and not use_safetensors:
+            raise ValueError(
+                "moe_expert_storage_path requires a safetensors checkpoint"
+            )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -265,17 +273,32 @@ class DefaultModelLoader(BaseModelLoader):
             )
         elif use_safetensors:
             if self.load_config.load_format == "fastsafetensors":
+                if skip_routed_experts:
+                    raise ValueError(
+                        "moe_expert_storage_path currently requires the default "
+                        "safetensors loader"
+                    )
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
+                if skip_routed_experts:
+                    raise ValueError(
+                        "moe_expert_storage_path currently requires the default "
+                        "safetensors loader"
+                    )
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
+                    if skip_routed_experts:
+                        raise ValueError(
+                            "moe_expert_storage_path is incompatible with "
+                            "enable_multithread_load"
+                        )
                     weights_iterator = multi_thread_safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
@@ -289,6 +312,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        skip_routed_experts=skip_routed_experts,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),

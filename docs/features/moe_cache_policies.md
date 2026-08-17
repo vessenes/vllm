@@ -1,8 +1,8 @@
 # MoE Expert Weight Caching
 
-vLLM can run MoE models that exceed available GPU memory by keeping all expert
-weights in CPU pinned memory and caching only the most-recently-used
-experts in a fixed-size GPU scratch buffer.
+vLLM can run MoE models that exceed GPU memory with a fixed HBM expert cache.
+For models that also exceed host RAM, a second bounded pinned-RAM cache reads
+independently indexed experts from the original safetensors checkpoint.
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -13,6 +13,11 @@ experts in a fixed-size GPU scratch buffer.
 | `--moe-expert-prefetch-lookahead N` | `0` | Future MoE calls visible to the horizon allocator |
 | `--moe-expert-prefetch-budget-mb N` | `0` | Maximum MiB enqueued by the allocator at each MoE call |
 | `--moe-expert-prefetch-max-inflight-mb N` | `0` | Maximum outstanding predicted H2D MiB; zero disables this second cap |
+| `--moe-expert-storage-path PATH` | unset | Local indexed safetensors checkpoint used as the out-of-core expert store |
+| `--moe-expert-host-cache-size N` | `0` | Pinned-RAM expert slots per layer |
+| `--moe-expert-storage-prefetch-budget-mb N` | `0` | Maximum predicted NVMe-to-RAM MiB admitted per MoE call |
+| `--moe-expert-storage-max-inflight-mb N` | `0` | Maximum outstanding NVMe-to-RAM MiB |
+| `--moe-expert-storage-workers N` | `4` | Background storage-read workers |
 
 !!! note
     Expert caching is not compatible with expert parallelism (EP > 1),
@@ -45,6 +50,26 @@ llm = LLM(
 The cache is implemented as a `CachedWeightProvider` — the kernel does not
 know or care where weights came from.
 
+### Checkpoints larger than RAM
+
+The storage-backed path does not first load or repack the complete expert
+pool. During normal model loading, routed-expert weights and scales are skipped
+before `safe_open().get_tensor()`. Dense and shared weights load normally. At
+runtime the provider uses `model.safetensors.index.json` to mmap one expert's
+gate, up, down and block-scale tensors into a reusable pinned slot.
+
+```bash
+vllm serve /models/GLM-5.2-FP8 \
+    --moe-expert-cache-size 20 \
+    --moe-expert-storage-path /models/GLM-5.2-FP8 \
+    --moe-expert-host-cache-size 64
+```
+
+This path currently supports canonical, block-quantized FP8 MoE checkpoints
+whose experts are stored as independent `gate_proj`, `up_proj` and `down_proj`
+entries, including Z.ai's GLM-5.2-FP8 layout. The checkpoint directory must be
+local and contain `model.safetensors.index.json`.
+
 ### Trace-driven prefetch
 
 An observed route trace can stand in for a trained predictor while evaluating
@@ -64,7 +89,11 @@ vllm serve MODEL \
     --moe-expert-prefetch-trace /tmp/routes.jsonl \
     --moe-expert-prefetch-lookahead 16 \
     --moe-expert-prefetch-budget-mb 128 \
-    --moe-expert-prefetch-max-inflight-mb 512
+    --moe-expert-prefetch-max-inflight-mb 512 \
+    --moe-expert-storage-path MODEL \
+    --moe-expert-host-cache-size 64 \
+    --moe-expert-storage-prefetch-budget-mb 256 \
+    --moe-expert-storage-max-inflight-mb 1024
 ```
 
 Each JSONL record identifies a layer-local forward, not an individual token:
@@ -73,13 +102,14 @@ Each JSONL record identifies a layer-local forward, not an individual token:
 {"step":0,"layer":"model.layers.1.mlp.experts","experts":[3,17,42,51]}
 ```
 
-The allocator scans the future events in deadline order. It fills the measured
-per-call byte budget without exceeding it, protects nearer predictions from
-later admissions, and limits queued copies with the optional in-flight cap.
-Copies run on a dedicated CUDA stream; the demand stream waits on an event only
-when it reaches a predicted expert whose copy is still running. Routing remains
-authoritative: an incorrect trace entry changes cache preparation, never the
-router's selected expert IDs.
+The allocator scans future events in deadline order at both boundaries. It
+fills independent measured NVMe-to-RAM and RAM-to-HBM budgets without exceeding
+either, protects nearer predictions from later admissions, and limits queued
+work with independent in-flight caps. Storage reads run on worker threads;
+copies run on a dedicated CUDA stream. The demand stream waits only if it
+reaches work that is still pending. Routing remains authoritative: an
+incorrect trace entry changes cache preparation, never the router's selected
+expert IDs.
 
 The final log reports bytes enqueued, useful and wasted predictions, demand
 waits, and budget or capacity blocks. Derive the byte budget from measured H2D

@@ -183,6 +183,8 @@ class RoutedExperts(PluggableLayer):
         offload_config = get_current_vllm_config().offload_config
         self._moe_expert_cache_size = offload_config.moe_expert_cache_size
         self._moe_expert_cache_split = offload_config.moe_expert_cache_split
+        self._moe_expert_storage_path = offload_config.moe_expert_storage_path
+        self._moe_expert_host_cache_size = offload_config.moe_expert_host_cache_size
         if self._moe_expert_cache_size > 0:
             self._validate_expert_cache_supported()
 
@@ -202,7 +204,26 @@ class RoutedExperts(PluggableLayer):
                 f"cache of {capacity} slots, fewer than the {top_k} experts a "
                 f"single token routes to. Set --moe-expert-cache-size >= {top_k}."
             )
+        if self._moe_expert_storage_path is not None:
+            host_capacity = min(
+                self._moe_expert_host_cache_size, self.local_num_experts
+            )
+            if host_capacity < top_k:
+                raise ValueError(
+                    f"moe_expert_host_cache_size={host_capacity} is fewer than "
+                    f"the {top_k} experts a token routes to"
+                )
         parallel = self.moe_config.moe_parallel_config
+        if self._moe_expert_storage_path is not None:
+            if parallel.tp_size != 1:
+                raise ValueError(
+                    "moe_expert_storage_path currently requires tensor_parallel_size=1"
+                )
+            if not getattr(self.quant_method, "block_quant", False):
+                raise ValueError(
+                    "moe_expert_storage_path currently supports native "
+                    "block-quantized FP8 experts"
+                )
         if parallel.use_ep:
             raise ValueError(
                 "moe_expert_cache_size is not compatible with expert "
@@ -290,17 +311,22 @@ class RoutedExperts(PluggableLayer):
         w2_scale_name = f"w2_{scale_suffix}"
         w13_scale = getattr(self, w13_scale_name, None)
         w2_scale = getattr(self, w2_scale_name, None)
+        capacity = min(self._moe_expert_cache_size, self.local_num_experts)
+        expected_scale_rows = (
+            capacity
+            if self._moe_expert_storage_path is not None
+            else self.local_num_experts
+        )
         per_expert_scales = (
             w13_scale is not None
             and w2_scale is not None
-            and w13_scale.size(0) == self.local_num_experts
-            and w2_scale.size(0) == self.local_num_experts
+            and w13_scale.size(0) == expected_scale_rows
+            and w2_scale.size(0) == expected_scale_rows
         )
         if not per_expert_scales:
             w13_scale = None
             w2_scale = None
 
-        capacity = min(self._moe_expert_cache_size, self.local_num_experts)
         offload_config = get_current_vllm_config().offload_config
         provider = CachedWeightProvider(
             capacity=capacity,
@@ -311,6 +337,9 @@ class RoutedExperts(PluggableLayer):
             split=self._moe_expert_cache_split,
             layer_name=self.layer_name,
             prefetch_coordinator=get_expert_prefetch_coordinator(offload_config),
+            num_experts=self.local_num_experts,
+            storage_path=self._moe_expert_storage_path,
+            host_capacity=self._moe_expert_host_cache_size,
         )
         self.expert_weight_provider = provider
 

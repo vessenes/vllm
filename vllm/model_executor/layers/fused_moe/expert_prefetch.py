@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -81,6 +82,9 @@ class ExpertPrefetchCoordinator:
         lookahead: int,
         budget_mb: float,
         max_inflight_mb: float,
+        storage_budget_mb: float = 0,
+        storage_max_inflight_mb: float = 0,
+        storage_workers: int = 4,
     ) -> None:
         self.schedule = (
             ExpertPrefetchSchedule(_rank_path(trace_path)) if trace_path else None
@@ -88,17 +92,29 @@ class ExpertPrefetchCoordinator:
         self.lookahead = lookahead
         self.budget_bytes = int(budget_mb * _MIB)
         self.max_inflight_bytes = int(max_inflight_mb * _MIB)
+        self.storage_budget_bytes = int(storage_budget_mb * _MIB)
+        self.storage_max_inflight_bytes = int(storage_max_inflight_mb * _MIB)
         self.providers: dict[str, Any] = {}
         self._layer_steps: dict[str, int] = {}
         self._scheduled: set[tuple[int, str]] = set()
+        self._storage_scheduled: set[tuple[int, str]] = set()
         self._streams: dict[torch.device, torch.cuda.Stream] = {}
         self._inflight: list[tuple[torch.cuda.Event, int]] = []
         self._inflight_bytes = 0
+        self._storage_executor = ThreadPoolExecutor(
+            max_workers=storage_workers, thread_name_prefix="vllm-expert-store"
+        )
+        self._storage_inflight: list[tuple[Future[int], int]] = []
+        self._storage_inflight_bytes = 0
         self._observations = 0
         self.prefetch_bytes = 0
         self.prefetch_experts = 0
         self.budget_blocked = 0
         self.capacity_blocked = 0
+        self.storage_prefetch_bytes = 0
+        self.storage_prefetch_experts = 0
+        self.storage_budget_blocked = 0
+        self.storage_capacity_blocked = 0
         self._trace_handle: TextIO | None = None
         self._closed = False
 
@@ -137,6 +153,57 @@ class ExpertPrefetchCoordinator:
             provider.expire_predictions(current_ordinal, set(actual_experts))
 
         self._reap_inflight()
+        self._reap_storage_inflight()
+
+        storage_remaining = self.storage_budget_bytes
+        if self.storage_max_inflight_bytes > 0:
+            storage_remaining = min(
+                storage_remaining,
+                max(
+                    0,
+                    self.storage_max_inflight_bytes - self._storage_inflight_bytes,
+                ),
+            )
+        if storage_remaining > 0:
+            for distance in range(1, self.lookahead + 1):
+                target_ordinal = current_ordinal + distance
+                target_step, target_index = divmod(target_ordinal, layer_count)
+                target_layer = self.schedule.layer_order[target_index]
+                key = (target_step, target_layer)
+                target_provider = self.providers.get(target_layer)
+                if target_provider is None or not target_provider.has_storage_backing:
+                    continue
+                predicted = self.schedule.get(target_step, target_layer)
+                if predicted is None:
+                    continue
+                if key in self._storage_scheduled and target_provider.host_contains_all(
+                    predicted
+                ):
+                    continue
+                outcome = target_provider.prefetch_host(
+                    list(predicted),
+                    deadline=target_ordinal,
+                    max_bytes=storage_remaining,
+                    executor=self._storage_executor,
+                )
+                storage_remaining -= outcome.bytes_enqueued
+                self.storage_prefetch_bytes += outcome.bytes_enqueued
+                self.storage_prefetch_experts += outcome.loaded
+                for future in outcome.futures:
+                    self._storage_inflight.append(
+                        (future, target_provider.bytes_per_expert)
+                    )
+                    self._storage_inflight_bytes += target_provider.bytes_per_expert
+                if outcome.resident == outcome.requested:
+                    self._storage_scheduled.add(key)
+                elif outcome.requested > outcome.resident:
+                    self.storage_capacity_blocked += 1
+                if storage_remaining < target_provider.bytes_per_expert:
+                    self.storage_budget_blocked += 1
+                    break
+        elif self.storage_budget_bytes > 0:
+            self.storage_budget_blocked += 1
+
         remaining = self.budget_bytes
         if self.max_inflight_bytes > 0:
             remaining = min(
@@ -152,13 +219,13 @@ class ExpertPrefetchCoordinator:
             target_step, target_index = divmod(target_ordinal, layer_count)
             target_layer = self.schedule.layer_order[target_index]
             key = (target_step, target_layer)
-            if key in self._scheduled:
-                continue
             target_provider = self.providers.get(target_layer)
-            if target_provider is None or target_provider is provider:
+            if target_provider is None:
                 continue
             predicted = self.schedule.get(target_step, target_layer)
             if predicted is None:
+                continue
+            if key in self._scheduled and target_provider.contains_all(predicted):
                 continue
 
             stream = self._stream_for(target_provider.device)
@@ -201,13 +268,37 @@ class ExpertPrefetchCoordinator:
         self._inflight = pending
         self._inflight_bytes = inflight_bytes
 
+    def _reap_storage_inflight(self) -> None:
+        pending: list[tuple[Future[int], int]] = []
+        inflight_bytes = 0
+        for future, byte_count in self._storage_inflight:
+            if future.done():
+                future.result()
+            else:
+                pending.append((future, byte_count))
+                inflight_bytes += byte_count
+        self._storage_inflight = pending
+        self._storage_inflight_bytes = inflight_bytes
+
     def log_summary(self) -> None:
+        hbm_hits = sum(p.hits for p in self.providers.values())
+        hbm_misses = sum(p.misses for p in self.providers.values())
+        storage_hits = sum(p.storage_hits for p in self.providers.values())
+        storage_misses = sum(p.storage_misses for p in self.providers.values())
         useful = sum(p.prefetch_useful for p in self.providers.values())
         wasted = sum(p.prefetch_wasted for p in self.providers.values())
         waits = sum(p.prefetch_waits for p in self.providers.values())
         logger.info(
-            "Expert prefetch: %.3f GiB, %d loaded, %d useful, %d wasted, "
-            "%d demand waits, %d budget blocks, %d capacity blocks",
+            "Expert cache: HBM %d hits/%d misses; pinned RAM %d hits/%d "
+            "storage misses. Expert prefetch: %.3f GiB, %d loaded, %d useful, "
+            "%d wasted, "
+            "%d demand waits, %d budget blocks, %d capacity blocks; "
+            "storage %.3f GiB, %d loaded, %d demand waits, %d budget blocks, "
+            "%d capacity blocks",
+            hbm_hits,
+            hbm_misses,
+            storage_hits,
+            storage_misses,
             self.prefetch_bytes / (1024**3),
             self.prefetch_experts,
             useful,
@@ -215,6 +306,11 @@ class ExpertPrefetchCoordinator:
             waits,
             self.budget_blocked,
             self.capacity_blocked,
+            self.storage_prefetch_bytes / (1024**3),
+            self.storage_prefetch_experts,
+            sum(p.storage_prefetch_waits for p in self.providers.values()),
+            self.storage_budget_blocked,
+            self.storage_capacity_blocked,
         )
 
     def close(self) -> None:
@@ -224,7 +320,8 @@ class ExpertPrefetchCoordinator:
         if self._trace_handle is not None:
             self._trace_handle.close()
             self._trace_handle = None
-        if self._observations > 0 and self.schedule is not None:
+        self._storage_executor.shutdown(wait=True, cancel_futures=False)
+        if self._observations > 0:
             self.log_summary()
 
 
@@ -246,6 +343,9 @@ def get_expert_prefetch_coordinator(config: Any) -> ExpertPrefetchCoordinator | 
             lookahead=config.moe_expert_prefetch_lookahead,
             budget_mb=config.moe_expert_prefetch_budget_mb,
             max_inflight_mb=config.moe_expert_prefetch_max_inflight_mb,
+            storage_budget_mb=config.moe_expert_storage_prefetch_budget_mb,
+            storage_max_inflight_mb=config.moe_expert_storage_max_inflight_mb,
+            storage_workers=config.moe_expert_storage_workers,
         )
         _COORDINATORS[key] = coordinator
     return coordinator

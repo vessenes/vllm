@@ -530,6 +530,15 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     moe_expert_cache_size: int = OffloadConfig.moe_expert_cache_size
     moe_expert_cache_split: str = OffloadConfig.moe_expert_cache_split
+    moe_expert_storage_path: str | None = OffloadConfig.moe_expert_storage_path
+    moe_expert_host_cache_size: int = OffloadConfig.moe_expert_host_cache_size
+    moe_expert_storage_prefetch_budget_mb: float = (
+        OffloadConfig.moe_expert_storage_prefetch_budget_mb
+    )
+    moe_expert_storage_max_inflight_mb: float = (
+        OffloadConfig.moe_expert_storage_max_inflight_mb
+    )
+    moe_expert_storage_workers: int = OffloadConfig.moe_expert_storage_workers
     moe_expert_prefetch_trace: str | None = OffloadConfig.moe_expert_prefetch_trace
     moe_expert_trace_output: str | None = OffloadConfig.moe_expert_trace_output
     moe_expert_prefetch_lookahead: int = OffloadConfig.moe_expert_prefetch_lookahead
@@ -1309,6 +1318,26 @@ class EngineArgs:
         offload_group.add_argument(
             "--moe-expert-prefetch-max-inflight-mb",
             **offload_kwargs["moe_expert_prefetch_max_inflight_mb"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-storage-path",
+            **offload_kwargs["moe_expert_storage_path"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-host-cache-size",
+            **offload_kwargs["moe_expert_host_cache_size"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-storage-prefetch-budget-mb",
+            **offload_kwargs["moe_expert_storage_prefetch_budget_mb"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-storage-max-inflight-mb",
+            **offload_kwargs["moe_expert_storage_max_inflight_mb"],
+        )
+        offload_group.add_argument(
+            "--moe-expert-storage-workers",
+            **offload_kwargs["moe_expert_storage_workers"],
         )
 
         # Multimodal related configs
@@ -2493,6 +2522,15 @@ class EngineArgs:
             moe_expert_prefetch_max_inflight_mb=(
                 self.moe_expert_prefetch_max_inflight_mb
             ),
+            moe_expert_storage_path=self.moe_expert_storage_path,
+            moe_expert_host_cache_size=self.moe_expert_host_cache_size,
+            moe_expert_storage_prefetch_budget_mb=(
+                self.moe_expert_storage_prefetch_budget_mb
+            ),
+            moe_expert_storage_max_inflight_mb=(
+                self.moe_expert_storage_max_inflight_mb
+            ),
+            moe_expert_storage_workers=self.moe_expert_storage_workers,
         )
 
         if self.gdn_prefill_backend is not None:

@@ -125,10 +125,31 @@ class OffloadConfig:
     """Maximum MiB of predicted expert copies outstanding on H2D streams.
     Zero leaves the per-call budget as the only transfer bound."""
 
+    moe_expert_storage_path: str | None = None
+    """Local safetensors checkpoint used as an out-of-core expert store.
+    Routed expert tensors are skipped during ordinary model loading and read
+    into a bounded pinned-RAM cache on demand or by the predictor."""
+
+    moe_expert_host_cache_size: int = Field(default=0, ge=0)
+    """Number of pinned-RAM expert slots per MoE layer when storage backing is
+    enabled. This is independent of ``moe_expert_cache_size`` in HBM."""
+
+    moe_expert_storage_prefetch_budget_mb: float = Field(default=0, ge=0)
+    """Maximum MiB of NVMe-to-pinned-RAM prediction work admitted per MoE
+    call."""
+
+    moe_expert_storage_max_inflight_mb: float = Field(default=0, ge=0)
+    """Maximum MiB of NVMe reads outstanding across worker threads. Zero
+    leaves the per-call storage budget as the only bound."""
+
+    moe_expert_storage_workers: int = Field(default=4, ge=1)
+    """Number of background workers used for predicted storage reads."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
         predictive = self.moe_expert_prefetch_trace is not None
+        storage = self.moe_expert_storage_path is not None
         if predictive and self.moe_expert_cache_size == 0:
             raise ValueError(
                 "moe_expert_prefetch_trace requires moe_expert_cache_size > 0"
@@ -144,6 +165,23 @@ class OffloadConfig:
         if self.moe_expert_trace_output and self.moe_expert_cache_size == 0:
             raise ValueError(
                 "moe_expert_trace_output requires moe_expert_cache_size > 0"
+            )
+        if storage and self.moe_expert_cache_size == 0:
+            raise ValueError(
+                "moe_expert_storage_path requires moe_expert_cache_size > 0"
+            )
+        if storage and self.moe_expert_host_cache_size == 0:
+            raise ValueError(
+                "moe_expert_storage_path requires moe_expert_host_cache_size > 0"
+            )
+        if not storage and self.moe_expert_host_cache_size > 0:
+            raise ValueError(
+                "moe_expert_host_cache_size requires moe_expert_storage_path"
+            )
+        if predictive and storage and self.moe_expert_storage_prefetch_budget_mb == 0:
+            raise ValueError(
+                "Predictive storage backing requires "
+                "moe_expert_storage_prefetch_budget_mb > 0"
             )
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
